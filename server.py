@@ -86,15 +86,16 @@ class WebhookResponse(BaseModel):
     class Config:
         from_attributes = True
 
+def get_voices(supabase_client: Client) -> Dict[str, str]:
+    """Fetch available voices from Supabase."""
+    response = supabase_client.table('voices').select('id, description').execute()
+    return {voice['id']: voice['description'] for voice in response.data}
+
 def parse_script_for_tts(story_script: str, characters: List[Dict]) -> List[Dict]:
     """Ask Mistral to parse the script and generate text-to-speech and sound effect segments"""
     
-    voice_lib = {
-        "NOpBlnGInO9m6vDvFkFC": "Grandpa Spuds Oxley, A friendly grandpa who knows how to enthrall his audience with tall tales and fun adventures.",
-        "kPzsL2i3teMYv0FxEYQ6": "Brittney, A young, vibrant female voice that is perfect for celebrity news, hot topics, and fun conversation. Great for YouTube channels, informative videos, how-to's, and more!",
-        "NYC9WEgkq1u4jiqBseQ9": "Russell, Fast paced, deep & serious British Documentary Narrator for dramatic subjects. For TV, News, Radio, YouTube & Social Media."
-    }
-
+    voice_lib = get_voices(supabase)
+    
     def validate_voice_id(segment: Dict) -> Dict:
         """Validate and potentially fix voice_id in a segment"""
         if segment["type"] != "text_to_speech":
@@ -117,15 +118,17 @@ def parse_script_for_tts(story_script: str, characters: List[Dict]) -> List[Dict
         
         return segment
 
+    # Generate voice information text from Supabase data
+    voice_info = "Available voices:\n"
+    for voice_id, description in voice_lib.items():
+        voice_info += f"- {description} (voice_id: {voice_id})\n"
+    
     # Create the prompt for Mistral
     prompt = f"""You are a script parser that converts story scripts into audio segments.
 
 Task: Parse the following script and output ONLY a JSON array of audio segments.
 
-Available voices:
-- Grandpa Spuds Oxley (voice_id: NOpBlnGInO9m6vDvFkFC): A friendly grandpa who knows how to enthrall his audience with tall tales and fun adventures.
-- Brittney (voice_id: kPzsL2i3teMYv0FxEYQ6): A young, vibrant female voice perfect for celebrity news, hot topics, and fun conversation.
-- Russell (voice_id: NYC9WEgkq1u4jiqBseQ9): Fast paced, deep & serious British Documentary Narrator for dramatic subjects.
+{voice_info}
 
 Required format for each segment:
 For speech:
