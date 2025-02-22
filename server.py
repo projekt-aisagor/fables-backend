@@ -22,6 +22,17 @@ load_dotenv()
 # Initialize FastAPI
 app = FastAPI()
 
+@app.middleware("http")
+async def log_request_body(request: Request, call_next):
+    if request.url.path == "/webhook/story":
+        try:
+            body = await request.body()
+            logger.info(f"Raw incoming webhook request body: {body.decode()}")
+        except Exception as e:
+            logger.error(f"Error reading request body: {e}")
+    response = await call_next(request)
+    return response
+
 # Initialize Mistral client
 mistral_api_key = os.environ["MISTRAL_API_KEY"]
 mistral_client = MistralClient(api_key=mistral_api_key)
@@ -35,13 +46,14 @@ supabase: Client = create_client(
 
 class StoryRecord(BaseModel):
     id: int
-    title: str
+    title: Optional[str] = None
     storyline_prompt: str
     minutes_long: int
     world_id: int
     user_id: uuid.UUID
     created_at: datetime
     story_script: Optional[str] = None
+    status: str
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'StoryRecord':
@@ -49,12 +61,17 @@ class StoryRecord(BaseModel):
         # Convert string to UUID for user_id if it's a string
         if isinstance(data.get('user_id'), str):
             data['user_id'] = uuid.UUID(data['user_id'])
+        
+        # Use storyline_prompt as title if title is not provided
+        if 'title' not in data:
+            data['title'] = data.get('storyline_prompt')
+            
         return cls(**data)
 
 class WebhookPayload(BaseModel):
     type: str
     table: str
-    schema_name: str  # Renamed from schema to avoid conflict
+    schema: str  # Changed from db_schema to match actual payload
     record: Dict[str, Any]  # Changed to Dict for initial parsing
     old_record: Optional[Dict[str, Any]] = None  # Changed to Dict for initial parsing
 
@@ -409,8 +426,14 @@ Write the complete story script:"""
             pass
 
 @app.post("/webhook/story", response_model=WebhookResponse)
-async def handle_story_webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
-    logger.info(f"Received webhook payload: {payload}")
+async def handle_story_webhook(request: Request, payload: WebhookPayload, background_tasks: BackgroundTasks):
+    # Log raw request body for debugging
+    body = await request.json()
+    logger.info(f"Raw webhook request body: {json.dumps(body, indent=2)}")
+    logger.info(f"Received webhook payload type: {payload.type}")
+    logger.info(f"Received webhook payload table: {payload.table}")
+    logger.info(f"Received webhook payload schema: {payload.schema}")
+    logger.info(f"Received webhook payload record: {json.dumps(payload.record, indent=2)}")
     
     if payload.table != "stories":
         logger.info("Ignoring non-stories table webhook")
