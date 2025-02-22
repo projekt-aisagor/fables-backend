@@ -36,7 +36,7 @@ async def log_request_body(request: Request, call_next):
 # Initialize Mistral client
 mistral_api_key = os.environ["MISTRAL_API_KEY"]
 mistral_client = MistralClient(api_key=mistral_api_key)
-model = "mistral-large-latest"
+model = "ministral-3b-latest" #"mistral-large-latest"
 
 # Initialize Supabase client
 supabase: Client = create_client(
