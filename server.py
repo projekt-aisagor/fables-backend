@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pydub import AudioSegment
 import fal_client
 import time
+import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -352,124 +353,144 @@ Write the complete story in the specified JSON format:"""
             logger.error(f"Error updating story in database: {e}")
             return
 
-        # Start audio generation with the sections
-        try:
-            # Initialize ElevenLabs client
-            client = ElevenLabs(
-                api_key=os.getenv("ELEVENLABS_API_KEY")
-            )
-            
-            # Generate a random filename for the final MP3
-            output_filename = f"{uuid.uuid4()}.mp3"
-            output_path = f"/tmp/{output_filename}"
-            logger.info(f"Starting parallel audio rendering")
-            
-            def process_segment(segment):
-                """Process a single audio segment. Validates voice IDs and generates audio for text_to_speech segments."""
-                # Validate voice ID if it's a text_to_speech segment
-                if segment["type"] == "text_to_speech":
-                    voice_id = segment["voice_id"]
-                    # If the voice_id is not in our library, try to find it by name
-                    if voice_id not in voice_lib:
-                        # Create a mapping of names to IDs
-                        name_to_id = {
-                            name.split(',')[0].strip(): id  # Take first part before comma as name
-                            for id, desc in voice_lib.items()
-                            for name in [desc.split(',')[0].strip()]  # Extract name before first comma
-                        }
-                        # Try to find the voice ID by name
-                        if voice_id in name_to_id:
-                            segment["voice_id"] = name_to_id[voice_id]
-                        else:
-                            logger.error(f"Invalid voice_id: {voice_id}. Available voices: {list(voice_lib.keys())}")
-                            return None
-
-                    # Create a temporary file for this segment
-                    temp_filename = f"/tmp/{uuid.uuid4()}.mp3"
-                    with open(temp_filename, "wb") as f:
-                        result = client.text_to_speech.convert(
-                            text=segment["text"],
-                            voice_id=segment["voice_id"],
-                            model_id=segment["model_id"],
-                            output_format="mp3_44100_128",
-                        )
-                        for chunk in result:
-                            f.write(chunk)
-                    return temp_filename
-                return None
-            
-            # Process segments in parallel
-            temp_files = []
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                temp_files = list(filter(None, executor.map(process_segment, story_data["sections"])))
-            
-            # Combine audio files
-            if temp_files:
-                combined = AudioSegment.from_mp3(temp_files[0])
-                for temp_file in temp_files[1:]:
-                    audio = AudioSegment.from_mp3(temp_file)
-                    combined += audio
-                
-                # Export the combined audio
-                combined.export(output_path, format="mp3")
-                
-                # Clean up temporary files
-                for temp_file in temp_files:
-                    try:
-                        os.remove(temp_file)
-                    except Exception as e:
-                        logger.error(f"Error removing temporary file {temp_file}: {e}")
-                
-            logger.info(f"Successfully rendered story to {output_path}")
-
-            # Upload the file to Supabase Storage
+        # Start both audio generation and image generation concurrently
+        async def generate_audio(story_data, story_id, supabase):
             try:
-                with open(output_path, 'rb') as f:
-                    supabase.storage.from_("story-audio").upload(
-                        path=output_filename,
-                        file=f,
-                        file_options={"content-type": "audio/mpeg"}
-                    )
-                logger.info(f"Successfully uploaded audio file to Supabase Storage: {output_filename}")
+                # Initialize ElevenLabs client
+                client = ElevenLabs(
+                    api_key=os.getenv("ELEVENLABS_API_KEY")
+                )
+                
+                # Generate a random filename for the final MP3
+                output_filename = f"{uuid.uuid4()}.mp3"
+                output_path = f"/tmp/{output_filename}"
+                logger.info(f"Starting parallel audio rendering")
+                
+                def process_segment(segment):
+                    """Process a single audio segment. Validates voice IDs and generates audio for text_to_speech segments."""
+                    # Validate voice ID if it's a text_to_speech segment
+                    if segment["type"] == "text_to_speech":
+                        voice_id = segment["voice_id"]
+                        # If the voice_id is not in our library, try to find it by name
+                        if voice_id not in voice_lib:
+                            # Create a mapping of names to IDs
+                            name_to_id = {
+                                name.split(',')[0].strip(): id  # Take first part before comma as name
+                                for id, desc in voice_lib.items()
+                                for name in [desc.split(',')[0].strip()]  # Extract name before first comma
+                            }
+                            # Try to find the voice ID by name
+                            if voice_id in name_to_id:
+                                segment["voice_id"] = name_to_id[voice_id]
+                            else:
+                                logger.error(f"Invalid voice_id: {voice_id}. Available voices: {list(voice_lib.keys())}")
+                                return None
 
-                # Update the story record with the audio file path and set status to ready
-                supabase.table("stories")\
-                    .update({
-                        "audio_file": output_filename,
-                        "status": "done"
-                    })\
-                    .eq("id", story_record.id)\
-                    .execute()
-                logger.info(f"Story {story_record.id} marked as ready with audio file {output_filename}")
+                        # Create a temporary file for this segment
+                        temp_filename = f"/tmp/{uuid.uuid4()}.mp3"
+                        with open(temp_filename, "wb") as f:
+                            result = client.text_to_speech.convert(
+                                text=segment["text"],
+                                voice_id=segment["voice_id"],
+                                model_id=segment["model_id"],
+                                output_format="mp3_44100_128",
+                            )
+                            for chunk in result:
+                                f.write(chunk)
+                        return temp_filename
+                    return None
+                
+                # Process segments in parallel
+                temp_files = []
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    temp_files = list(filter(None, executor.map(process_segment, story_data["sections"])))
+                
+                # Combine audio files
+                if temp_files:
+                    combined = AudioSegment.from_mp3(temp_files[0])
+                    for temp_file in temp_files[1:]:
+                        audio = AudioSegment.from_mp3(temp_file)
+                        combined += audio
+                    
+                    # Export the combined audio
+                    combined.export(output_path, format="mp3")
+                    
+                    # Clean up temporary files
+                    for temp_file in temp_files:
+                        try:
+                            os.remove(temp_file)
+                        except Exception as e:
+                            logger.error(f"Error removing temporary file {temp_file}: {e}")
+                    
+                logger.info(f"Successfully rendered story to {output_path}")
 
-                # Clean up the temporary file
-                os.remove(output_path)
-                logger.info(f"Cleaned up temporary file {output_path}")
+                # Upload the file to Supabase Storage
+                try:
+                    with open(output_path, 'rb') as f:
+                        supabase.storage.from_("story-audio").upload(
+                            path=output_filename,
+                            file=f,
+                            file_options={"content-type": "audio/mpeg"}
+                        )
+                    logger.info(f"Successfully uploaded audio file to Supabase Storage: {output_filename}")
 
+                    # Update the story record with the audio file path and set status to ready
+                    supabase.table("stories")\
+                        .update({
+                            "audio_file": output_filename,
+                            "status": "done"
+                        })\
+                        .eq("id", story_id)\
+                        .execute()
+                    logger.info(f"Story {story_id} marked as ready with audio file {output_filename}")
+
+                    # Clean up the temporary file
+                    os.remove(output_path)
+                    logger.info(f"Cleaned up temporary file {output_path}")
+
+                except Exception as e:
+                    logger.error(f"Error uploading to Supabase Storage: {e}")
+                    # Update status to error
+                    supabase.table("stories")\
+                        .update({"status": "error"})\
+                        .eq("id", story_id)\
+                        .execute()
+                
             except Exception as e:
-                logger.error(f"Error uploading to Supabase Storage: {e}")
+                logger.error(f"Error in audio generation process: {e}")
                 # Update status to error
                 supabase.table("stories")\
                     .update({"status": "error"})\
-                    .eq("id", story_record.id)\
+                    .eq("id", story_id)\
                     .execute()
-                
-        except Exception as e:
-            logger.error(f"Error in audio generation process: {e}")
-            # Update status to error
-            supabase.table("stories")\
-                .update({"status": "error"})\
-                .eq("id", story_record.id)\
-                .execute()
-            
-        # Generate image prompt from the story
+
+        async def generate_story_image(prompt: str) -> dict:
+            """Generate an image using Fal AI based on the scene prompt."""
+            try:
+                result = fal_client.subscribe(
+                    "fal-ai/flux-pro/v1.1",
+                    arguments={"prompt": prompt},
+                    with_logs=True
+                )
+                return result
+            except Exception as e:
+                logger.error(f"Error generating image: {e}")
+                return None
+
+        # Generate image prompt and start image generation
         scene_prompt = generate_scene_prompt(json.dumps(story_data), mistral)
         logger.info(f"Generated scene prompt: {scene_prompt}")
+        image_task = asyncio.create_task(generate_story_image(scene_prompt))
         
-        # Generate the image
-        image_result = await generate_story_image(scene_prompt)
-        if image_result and 'images' in image_result and image_result['images']:
-            image_url = image_result['images'][0]['url']
+        # Start audio generation
+        audio_task = asyncio.create_task(generate_audio(story_data, story_record.id, supabase))
+        
+        # Wait for both tasks to complete
+        await asyncio.gather(audio_task, image_task)
+        
+        # Handle image result
+        if image_task.result() and 'images' in image_task.result() and image_task.result()['images']:
+            image_url = image_task.result()['images'][0]['url']
             
             # Update the story record with the image URL
             supabase.table("stories").update({
@@ -478,7 +499,7 @@ Write the complete story in the specified JSON format:"""
             logger.info(f"Updated story {story_record.id} with image URL: {image_url}")
         else:
             logger.error("Failed to generate image or get URL from response")
-            
+                
     except Exception as e:
         logger.error(f"Error in story generation: {e}")
         # Update status to error
@@ -503,19 +524,6 @@ def generate_scene_prompt(story_script: str, mistral_client: MistralClient) -> s
     
     # Access the content from the response directly
     return response.choices[0].message.content
-
-async def generate_story_image(prompt: str) -> dict:
-    """Generate an image using Fal AI based on the scene prompt."""
-    try:
-        result = fal_client.subscribe(
-            "fal-ai/flux-pro/v1.1",
-            arguments={"prompt": prompt},
-            with_logs=True
-        )
-        return result
-    except Exception as e:
-        logger.error(f"Error generating image: {e}")
-        return None
 
 @app.post("/webhook/story", response_model=WebhookResponse)
 async def handle_story_webhook(request: Request, payload: WebhookPayload, background_tasks: BackgroundTasks):
