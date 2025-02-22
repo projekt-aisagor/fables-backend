@@ -260,6 +260,44 @@ Remember: Output ONLY the JSON array, nothing else."""
     except Exception as e:
         raise ValueError(f"Error processing segments: {str(e)}")
 
+def get_language_name(language_code: str) -> str:
+    """Convert ISO language code to full language name."""
+    language_map = {
+        "ar": "Arabic",
+        "bg": "Bulgarian",
+        "zh": "Chinese",
+        "hr": "Croatian",
+        "cs": "Czech",
+        "da": "Danish",
+        "nl": "Dutch",
+        "en": "English",
+        "tl": "Filipino",
+        "fi": "Finnish",
+        "fr": "French",
+        "de": "German",
+        "el": "Greek",
+        "hi": "Hindi",
+        "hu": "Hungarian",
+        "id": "Indonesian",
+        "it": "Italian",
+        "ja": "Japanese",
+        "ko": "Korean",
+        "ms": "Malay",
+        "no": "Norwegian",
+        "pl": "Polish",
+        "pt": "Portuguese",
+        "ro": "Romanian",
+        "ru": "Russian",
+        "sk": "Slovak",
+        "es": "Spanish",
+        "sv": "Swedish",
+        "ta": "Tamil",
+        "tr": "Turkish",
+        "uk": "Ukrainian",
+        "vi": "Vietnamese"
+    }
+    return language_map.get(language_code.lower(), "English")  # Default to English if code not found
+
 async def generate_story(story_record: StoryRecord, supabase: Client, mistral: MistralClient):
     """Background task to generate and save the story"""
     logger.info(f"Starting async story generation for story {story_record.id}")
@@ -327,7 +365,8 @@ async def generate_story(story_record: StoryRecord, supabase: Client, mistral: M
         base_values_str = ", ".join(base_values_list)
         
         # Generate story script using Mistral
-        prompt = f"""You are a professional storyteller crafting an engaging audio story in {language}. Create a story that:
+        language_name = get_language_name(language)
+        prompt = f"""You are a professional storyteller crafting an engaging audio story in {language_name}. Create a story that:
 1. Follows this storyline prompt: {story_record.storyline_prompt}
 2. Is approximately {story_record.minutes_long} minutes long when read aloud at a natural pace
 3. Takes place in the world: {world.data['name']} - {world.data['description']}
@@ -344,7 +383,7 @@ Format the story as a professional audio script with:
 
 The story should flow naturally when read aloud and engage listeners through vivid descriptions and compelling dialogue. Avoid complex sentence structures or visual-only references that don't translate well to audio.
 
-IMPORTANT: Write the complete story script in {language}. Make sure all text, including speaker attributions and sound effects, is in {language}.
+IMPORTANT: Write the complete story script in {language_name}. Make sure all text, including speaker attributions and sound effects, is in {language_name}.
 
 Write the complete story script:"""
         
