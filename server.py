@@ -89,17 +89,50 @@ class WebhookResponse(BaseModel):
 def parse_script_for_tts(story_script: str, characters: List[Dict]) -> List[Dict]:
     """Ask Mistral to parse the script and generate text-to-speech and sound effect segments"""
     
+    voice_lib = {
+        "NOpBlnGInO9m6vDvFkFC": "Grandpa Spuds Oxley, A friendly grandpa who knows how to enthrall his audience with tall tales and fun adventures.",
+        "kPzsL2i3teMYv0FxEYQ6": "Brittney, A young, vibrant female voice that is perfect for celebrity news, hot topics, and fun conversation. Great for YouTube channels, informative videos, how-to's, and more!",
+        "NYC9WEgkq1u4jiqBseQ9": "Russell, Fast paced, deep & serious British Documentary Narrator for dramatic subjects. For TV, News, Radio, YouTube & Social Media."
+    }
+
+    def validate_voice_id(segment: Dict) -> Dict:
+        """Validate and potentially fix voice_id in a segment"""
+        if segment["type"] != "text_to_speech":
+            return segment
+            
+        voice_id = segment["voice_id"]
+        # If the voice_id is not in our library, try to find it by name
+        if voice_id not in voice_lib:
+            # Create a mapping of names to IDs
+            name_to_id = {
+                name.split(',')[0].strip(): id  # Take first part before comma as name
+                for id, desc in voice_lib.items()
+                for name in [desc.split(',')[0].strip()]  # Extract name before first comma
+            }
+            # Try to find the voice ID by name
+            if voice_id in name_to_id:
+                segment["voice_id"] = name_to_id[voice_id]
+            else:
+                raise ValueError(f"Invalid voice_id: {voice_id}. Available voices: {list(voice_lib.keys())}")
+        
+        return segment
+
     # Create the prompt for Mistral
     prompt = f"""You are a script parser that converts story scripts into audio segments.
 
 Task: Parse the following script and output ONLY a JSON array of audio segments.
+
+Available voices:
+- Grandpa Spuds Oxley (voice_id: NOpBlnGInO9m6vDvFkFC): A friendly grandpa who knows how to enthrall his audience with tall tales and fun adventures.
+- Brittney (voice_id: kPzsL2i3teMYv0FxEYQ6): A young, vibrant female voice perfect for celebrity news, hot topics, and fun conversation.
+- Russell (voice_id: NYC9WEgkq1u4jiqBseQ9): Fast paced, deep & serious British Documentary Narrator for dramatic subjects.
 
 Required format for each segment:
 For speech:
 {{
     "type": "text_to_speech",
     "text": "The actual text to speak",
-    "voice_id": "JBFqnCBsd6RMkjVDRZzb",
+    "voice_id": "<use appropriate voice_id from above>",
     "model_id": "eleven_multilingual_v2"
 }}
 
@@ -190,6 +223,9 @@ Remember: Output ONLY the JSON array, nothing else."""
         # Parse the JSON
         segments = json.loads(content)
         
+        # Validate and potentially fix voice IDs
+        segments = [validate_voice_id(segment) for segment in segments]
+        
         # Validate the structure
         if not isinstance(segments, list):
             raise ValueError("Response is not a JSON array")
@@ -215,12 +251,9 @@ Remember: Output ONLY the JSON array, nothing else."""
         return segments
         
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}")
-        logger.error(f"Problematic content: {content}")
-        raise
+        raise ValueError(f"Failed to parse JSON response: {str(e)}")
     except Exception as e:
-        logger.error(f"Error parsing script: {e}")
-        raise
+        raise ValueError(f"Error processing segments: {str(e)}")
 
 async def generate_story(story_record: StoryRecord, supabase: Client, mistral: MistralClient):
     """Background task to generate and save the story"""
