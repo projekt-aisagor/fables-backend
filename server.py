@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from mistralai.client import MistralClient
 from mistralai.models.chat_completion import ChatMessage
 from dotenv import load_dotenv
@@ -67,23 +67,11 @@ class WebhookResponse(BaseModel):
     class Config:
         from_attributes = True
 
-@app.post("/webhook/story", response_model=WebhookResponse)
-async def handle_story_webhook(payload: WebhookPayload):
-    logger.info(f"Received webhook payload: {payload}")
-    
-    if payload.table != "stories":
-        logger.info("Ignoring non-stories table webhook")
-        return WebhookResponse(
-            status="ignored",
-            message="not stories table"
-        )
+async def generate_story(story_record: StoryRecord, supabase: Client, mistral: MistralClient):
+    """Background task to generate and save the story"""
+    logger.info(f"Starting async story generation for story {story_record.id}")
     
     try:
-        # Convert record dict to StoryRecord
-        logger.info("Converting record to StoryRecord")
-        story_record = StoryRecord.from_dict(payload.record)
-        logger.info(f"Created StoryRecord: {story_record}")
-        
         # Fetch additional data from Supabase
         logger.info("Fetching additional data from Supabase")
         
@@ -91,43 +79,50 @@ async def handle_story_webhook(payload: WebhookPayload):
         try:
             world = supabase.table("worlds").select("*").eq("id", story_record.world_id).single().execute()
             if not world.data:
-                return WebhookResponse(
-                    status="error",
-                    message=f"World with id {story_record.world_id} not found in database. Please create the world first."
-                )
+                logger.error(f"World with id {story_record.world_id} not found in database")
+                return
         except Exception as e:
             logger.error(f"Error fetching world data: {e}")
-            return WebhookResponse(
-                status="error",
-                message=f"World with id {story_record.world_id} not found in database. Please create the world first."
-            )
+            return
         
         # Get character data
         try:
             characters = supabase.table("story_characters")\
                 .select("characters(*)").eq("story_id", story_record.id).execute()
             if not characters.data:
-                return WebhookResponse(
-                    status="error",
-                    message=f"No characters found for story {story_record.id}. Please add at least one character to the story."
-                )
+                logger.error(f"No characters found for story {story_record.id}")
+                return
         except Exception as e:
             logger.error(f"Error fetching character data: {e}")
-            return WebhookResponse(
-                status="error",
-                message=f"Error fetching characters for story {story_record.id}. Please ensure characters are properly set up."
-            )
+            return
         
-        # Get base values for the user
+        # Get base values and language for the user
         try:
             base_values = supabase.table("base_values")\
-                .select("value").eq("user_id", story_record.user_id).execute()
-            base_values_list = [v["value"] for v in base_values.data] if base_values.data else []
+                .select("value, language")\
+                .eq("user_id", story_record.user_id)\
+                .execute()
+            
+            # Extract values and language
+            base_values_list = []
+            language = "en"  # Default to English if not specified
+            
+            if base_values.data:
+                base_values_list = [v["value"] for v in base_values.data if v.get("value")]
+                # Use the language from the first row that has it defined
+                for value in base_values.data:
+                    if value.get("language"):
+                        language = value["language"]
+                        break
+                        
             if not base_values_list:
                 logger.warning(f"No base values found for user {story_record.user_id}")
+            logger.info(f"Using language: {language}")
+            
         except Exception as e:
             logger.error(f"Error fetching base values: {e}")
             base_values_list = []
+            language = "en"  # Default to English on error
         
         # Format character descriptions
         character_descriptions = "\n".join([
@@ -139,7 +134,7 @@ async def handle_story_webhook(payload: WebhookPayload):
         base_values_str = ", ".join(base_values_list)
         
         # Generate story script using Mistral
-        prompt = f"""You are a professional storyteller crafting an engaging audio story. Create a story that:
+        prompt = f"""You are a professional storyteller crafting an engaging audio story in {language}. Create a story that:
 1. Follows this storyline prompt: {story_record.storyline_prompt}
 2. Is approximately {story_record.minutes_long} minutes long when read aloud at a natural pace
 3. Takes place in the world: {world.data['name']} - {world.data['description']}
@@ -156,6 +151,8 @@ Format the story as a professional audio script with:
 
 The story should flow naturally when read aloud and engage listeners through vivid descriptions and compelling dialogue. Avoid complex sentence structures or visual-only references that don't translate well to audio.
 
+IMPORTANT: Write the complete story script in {language}. Make sure all text, including speaker attributions and sound effects, is in {language}.
+
 Write the complete story script:"""
         
         logger.info(f"Generating story with prompt: {prompt}")
@@ -167,30 +164,61 @@ Write the complete story script:"""
             )
         ]
         
-        chat_response = mistral_client.chat(
-            model=model,
-            messages=messages
+        # Generate the story
+        chat_response = mistral.chat(
+            messages=messages,
+            model=model
         )
         
-        generated_story = chat_response.choices[0].message.content
-        logger.info("Successfully generated story")
-        logger.info(f"Generated story: {generated_story[:100]}...")  # Log first 100 chars
+        story_script = chat_response.choices[0].message.content
+        logger.info("Story generated successfully")
         
         # Update the story in Supabase
-        logger.info(f"Updating story in Supabase for ID: {story_record.id}")
-        result = supabase.table("stories") \
-            .update({"story_script": generated_story}) \
-            .eq("id", story_record.id) \
-            .execute()
-        logger.info("Successfully updated story in Supabase")
+        try:
+            supabase.table("stories")\
+                .update({"story_script": story_script})\
+                .eq("id", story_record.id)\
+                .execute()
+            logger.info(f"Story {story_record.id} updated with generated script")
+        except Exception as e:
+            logger.error(f"Error updating story in database: {e}")
             
+    except Exception as e:
+        logger.error(f"Error in story generation process: {e}")
+
+@app.post("/webhook/story", response_model=WebhookResponse)
+async def handle_story_webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
+    logger.info(f"Received webhook payload: {payload}")
+    
+    if payload.table != "stories":
+        logger.info("Ignoring non-stories table webhook")
         return WebhookResponse(
-            status="success",
-            story_id=story_record.id
+            status="ignored",
+            message="not stories table"
+        )
+    
+    try:
+        # Convert record dict to StoryRecord
+        logger.info("Converting record to StoryRecord")
+        story_record = StoryRecord.from_dict(payload.record)
+        logger.info(f"Created StoryRecord: {story_record}")
+        
+        # Queue the story generation as a background task
+        background_tasks.add_task(
+            generate_story,
+            story_record=story_record,
+            supabase=supabase,
+            mistral=mistral_client
+        )
+        
+        return WebhookResponse(
+            status="accepted",
+            story_id=story_record.id,
+            message="Story generation started"
         )
         
     except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
+        logger.error(f"Error processing webhook: {e}")
         return WebhookResponse(
             status="error",
             message=str(e)
