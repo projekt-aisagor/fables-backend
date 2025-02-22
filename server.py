@@ -93,173 +93,6 @@ def get_voices(supabase_client: Client) -> Dict[str, str]:
     response = supabase_client.table('voices').select('id, description').execute()
     return {voice['id']: voice['description'] for voice in response.data}
 
-def parse_script_for_tts(story_script: str, characters: List[Dict]) -> List[Dict]:
-    """Ask Mistral to parse the script and generate text-to-speech and sound effect segments"""
-    
-    voice_lib = get_voices(supabase)
-    
-    def validate_voice_id(segment: Dict) -> Dict:
-        """Validate and potentially fix voice_id in a segment"""
-        if segment["type"] != "text_to_speech":
-            return segment
-            
-        voice_id = segment["voice_id"]
-        # If the voice_id is not in our library, try to find it by name
-        if voice_id not in voice_lib:
-            # Create a mapping of names to IDs
-            name_to_id = {
-                name.split(',')[0].strip(): id  # Take first part before comma as name
-                for id, desc in voice_lib.items()
-                for name in [desc.split(',')[0].strip()]  # Extract name before first comma
-            }
-            # Try to find the voice ID by name
-            if voice_id in name_to_id:
-                segment["voice_id"] = name_to_id[voice_id]
-            else:
-                raise ValueError(f"Invalid voice_id: {voice_id}. Available voices: {list(voice_lib.keys())}")
-        
-        return segment
-
-    # Generate voice information text from Supabase data
-    voice_info = "Available voices:\n"
-    for voice_id, description in voice_lib.items():
-        voice_info += f"- {description} (voice_id: {voice_id})\n"
-    
-    # Create the prompt for Mistral
-    prompt = f"""You are a script parser that converts story scripts into audio segments.
-
-Task: Parse the following script and output ONLY a JSON array of audio segments.
-
-{voice_info}
-
-Required format for each segment:
-For speech:
-{{
-    "type": "text_to_speech",
-    "text": "The actual text to speak",
-    "voice_id": "<use appropriate voice_id from above>",
-    "model_id": "eleven_multilingual_v2"
-}}
-
-For sound effects (convert descriptions to English):
-{{
-    "type": "text_to_sound_effects",
-    "text": "sound of birds chirping in the forest"
-}}
-
-For pauses:
-{{
-    "type": "pause",
-    "seconds": 1
-}}
-
-Rules:
-1. Split the script into logical segments at each speaker change or paragraph
-2. Remove speaker attributions (e.g., "LUNA:") from the text
-3. Convert sound effects (in parentheses) into English text_to_sound_effects segments
-4. Add 1-second pauses between major segments
-5. Ensure the output is valid JSON
-6. Return ONLY the JSON array, no explanations or other text
-
-Example output:
-[
-    {{
-        "type": "text_to_speech",
-        "text": "Once upon a time in a magical forest...",
-        "voice_id": "JBFqnCBsd6RMkjVDRZzb",
-        "model_id": "eleven_multilingual_v2"
-    }},
-    {{
-        "type": "text_to_sound_effects",
-        "text": "sound of gentle wind rustling through leaves"
-    }},
-    {{
-        "type": "pause",
-        "seconds": 1
-    }},
-    {{
-        "type": "text_to_speech",
-        "text": "Who goes there? Show yourself!",
-        "voice_id": "JBFqnCBsd6RMkjVDRZzb",
-        "model_id": "eleven_multilingual_v2"
-    }}
-]
-
-Here is the script to parse:
-
-{story_script}
-
-Remember: Output ONLY the JSON array, nothing else."""
-
-    try:
-        # Get Mistral's response
-        messages = [
-            ChatMessage(
-                role="user",
-                content=prompt
-            )
-        ]
-        
-        response = mistral_client.chat(
-            messages=messages,
-            model=model
-        )
-        
-        # Get the content and debug log it
-        content = response.choices[0].message.content
-        logger.info(f"Raw Mistral response:\n{content}")
-        
-        # Try to find JSON array in the response
-        content = content.strip()
-        if not content.startswith('['):
-            start_idx = content.find('[')
-            if start_idx != -1:
-                content = content[start_idx:]
-            else:
-                raise ValueError("No JSON array found in response")
-        
-        if not content.endswith(']'):
-            end_idx = content.rfind(']')
-            if end_idx != -1:
-                content = content[:end_idx+1]
-            else:
-                raise ValueError("No JSON array end found in response")
-        
-        # Parse the JSON
-        segments = json.loads(content)
-        
-        # Validate and potentially fix voice IDs
-        segments = [validate_voice_id(segment) for segment in segments]
-        
-        # Validate the structure
-        if not isinstance(segments, list):
-            raise ValueError("Response is not a JSON array")
-        
-        for segment in segments:
-            if "type" not in segment:
-                raise ValueError(f"Missing 'type' in segment: {segment}")
-                
-            if segment["type"] == "text_to_speech":
-                required_keys = {"text", "voice_id", "model_id"}
-                if not all(key in segment for key in required_keys):
-                    raise ValueError(f"Missing required keys in text_to_speech segment: {segment}")
-            elif segment["type"] == "text_to_sound_effects":
-                if "text" not in segment:
-                    raise ValueError(f"Missing 'text' in sound_effects segment: {segment}")
-            elif segment["type"] == "pause":
-                if "seconds" not in segment:
-                    raise ValueError(f"Missing 'seconds' in pause segment: {segment}")
-            else:
-                raise ValueError(f"Unknown segment type: {segment['type']}")
-        
-        logger.info(f"Successfully parsed {len(segments)} audio segments")
-        return segments
-        
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse JSON response: {str(e)}")
-    except Exception as e:
-        raise ValueError(f"Error processing segments: {str(e)}")
-
 def get_language_name(language_code: str) -> str:
     """Convert ISO language code to full language name."""
     language_map = {
@@ -364,6 +197,12 @@ async def generate_story(story_record: StoryRecord, supabase: Client, mistral: M
         # Format base values string
         base_values_str = ", ".join(base_values_list)
         
+        # Get voice information
+        voice_lib = get_voices(supabase)
+        voice_info = "Available voices:\n"
+        for voice_id, description in voice_lib.items():
+            voice_info += f"- {description} (voice_id: {voice_id})\n"
+        
         # Generate story script using Mistral
         language_name = get_language_name(language)
         prompt = f"""You are a professional storyteller crafting an engaging audio story in {language_name}. Create a story that:
@@ -374,18 +213,40 @@ async def generate_story(story_record: StoryRecord, supabase: Client, mistral: M
 {character_descriptions}
 5. Aligns with these base values: {base_values_str}
 
-Format the story as a professional audio script with:
-- Clear speaker attribution for dialogue
-- Natural pacing and pauses indicated by [...] for dramatic effect
-- Sound effect suggestions in parentheses (if appropriate)
-- Proper pronunciation guides for unusual names in [square brackets]
-- Scene transitions marked with subtle audio cues
+Your output must be a JSON object with the following structure:
+{{
+    "title": "Story Title",
+    "sections": [
+        {{
+            "type": "text_to_speech",
+            "text": "The actual text to speak",
+            "voice_id": "<voice_id from available voices>",
+            "model_id": "eleven_multilingual_v2"
+        }},
+        {{
+            "type": "text_to_sound_effects",
+            "text": "sound of birds chirping in the forest"
+        }},
+        {{
+            "type": "pause",
+            "seconds": 1
+        }}
+    ]
+}}
 
-The story should flow naturally when read aloud and engage listeners through vivid descriptions and compelling dialogue. Avoid complex sentence structures or visual-only references that don't translate well to audio.
+{voice_info}
 
-IMPORTANT: Write the complete story script in {language_name}. Make sure all text, including speaker attributions and sound effects, is in {language_name}.
+Guidelines for sections:
+1. Split the story into logical segments at each speaker change or paragraph
+2. Remove speaker attributions (e.g., "LUNA:") from the text
+3. Convert sound effects (in parentheses) into text_to_sound_effects segments
+4. Add 1-second pauses between major segments
+5. Use appropriate voices for each character consistently
+6. Write all text in {language_name}, except sound effect descriptions which should be in English
+7. The story should flow naturally when read aloud and engage listeners through vivid descriptions and compelling dialogue
+8. Avoid complex sentence structures or visual-only references that don't translate well to audio
 
-Write the complete story script:"""
+Write the complete story in the specified JSON format:"""
         
         logger.info(f"Generating story with prompt: {prompt}")
         
@@ -402,13 +263,86 @@ Write the complete story script:"""
             model=model
         )
         
-        story_script = chat_response.choices[0].message.content
+        # Log the raw response for debugging
+        raw_content = chat_response.choices[0].message.content
+        logger.info("Raw response from Mistral:")
+        logger.info(raw_content)
+        
+        try:
+            # Try to clean the response if it contains markdown code blocks
+            content = raw_content.strip()
+            if content.startswith("```json"):
+                content = content[7:]  # Remove ```json
+            if content.startswith("```"):
+                content = content[3:]  # Remove ```
+            if content.endswith("```"):
+                content = content[:-3]  # Remove trailing ```
+            content = content.strip()
+            
+            logger.info("Cleaned content for JSON parsing:")
+            logger.info(content)
+            
+            # Try to parse the JSON
+            story_data = json.loads(content)
+            
+            # Validate the structure
+            if not isinstance(story_data, dict):
+                raise ValueError("Response is not a JSON object")
+            if "title" not in story_data:
+                raise ValueError("Missing 'title' in response")
+            if "sections" not in story_data:
+                raise ValueError("Missing 'sections' in response")
+            if not isinstance(story_data["sections"], list):
+                raise ValueError("'sections' is not an array")
+                
+            # Validate each section
+            for i, section in enumerate(story_data["sections"]):
+                if "type" not in section:
+                    raise ValueError(f"Missing 'type' in section {i}")
+                if section["type"] == "text_to_speech":
+                    required_keys = {"text", "voice_id", "model_id"}
+                    missing_keys = required_keys - set(section.keys())
+                    if missing_keys:
+                        raise ValueError(f"Missing required keys {missing_keys} in text_to_speech section {i}")
+                elif section["type"] == "text_to_sound_effects":
+                    if "text" not in section:
+                        raise ValueError(f"Missing 'text' in sound_effects section {i}")
+                elif section["type"] == "pause":
+                    if "seconds" not in section:
+                        raise ValueError(f"Missing 'seconds' in pause section {i}")
+                else:
+                    raise ValueError(f"Unknown section type: {section['type']} in section {i}")
+            
+            logger.info(f"Successfully parsed story data with {len(story_data['sections'])} sections")
+            
+        except json.JSONDecodeError as e:
+            logger.error("JSON parsing error:")
+            logger.error(f"Error message: {str(e)}")
+            logger.error(f"Error position: char {e.pos}")
+            logger.error(f"Line number: {e.lineno}")
+            logger.error(f"Column number: {e.colno}")
+            logger.error("Content around error:")
+            if e.pos > 0:
+                start = max(0, e.pos - 50)
+                end = min(len(content), e.pos + 50)
+                logger.error(f"...{content[start:e.pos]}>>>HERE>>>{content[e.pos:end]}...")
+            raise
+        except ValueError as e:
+            logger.error(f"Validation error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error while parsing response: {str(e)}")
+            raise
+            
         logger.info("Story generated successfully")
         
-        # Update the story in Supabase with the script
+        # Update the story script in Supabase
         try:
             supabase.table("stories")\
-                .update({"story_script": story_script, "status": "generating_audio"})\
+                .update({
+                    "story_script": json.dumps(story_data),
+                    "status": "generating_audio"
+                })\
                 .eq("id", story_record.id)\
                 .execute()
             logger.info(f"Story {story_record.id} updated with generated script")
@@ -416,10 +350,8 @@ Write the complete story script:"""
             logger.error(f"Error updating story in database: {e}")
             return
 
-        # Parse the script into segments for audio generation
+        # Start audio generation with the sections
         try:
-            segments = parse_script_for_tts(story_script, characters.data)
-            
             # Initialize ElevenLabs client
             client = ElevenLabs(
                 api_key=os.getenv("ELEVENLABS_API_KEY")
@@ -431,26 +363,43 @@ Write the complete story script:"""
             logger.info(f"Starting parallel audio rendering")
             
             def process_segment(segment):
-                if segment["type"] != "text_to_speech":
-                    return None
-                    
-                # Create a temporary file for this segment
-                temp_filename = f"/tmp/{uuid.uuid4()}.mp3"
-                with open(temp_filename, "wb") as f:
-                    result = client.text_to_speech.convert(
-                        text=segment["text"],
-                        voice_id=segment["voice_id"],
-                        model_id=segment["model_id"],
-                        output_format="mp3_44100_128",
-                    )
-                    for chunk in result:
-                        f.write(chunk)
-                return temp_filename
+                """Process a single audio segment. Validates voice IDs and generates audio for text_to_speech segments."""
+                # Validate voice ID if it's a text_to_speech segment
+                if segment["type"] == "text_to_speech":
+                    voice_id = segment["voice_id"]
+                    # If the voice_id is not in our library, try to find it by name
+                    if voice_id not in voice_lib:
+                        # Create a mapping of names to IDs
+                        name_to_id = {
+                            name.split(',')[0].strip(): id  # Take first part before comma as name
+                            for id, desc in voice_lib.items()
+                            for name in [desc.split(',')[0].strip()]  # Extract name before first comma
+                        }
+                        # Try to find the voice ID by name
+                        if voice_id in name_to_id:
+                            segment["voice_id"] = name_to_id[voice_id]
+                        else:
+                            logger.error(f"Invalid voice_id: {voice_id}. Available voices: {list(voice_lib.keys())}")
+                            return None
+
+                    # Create a temporary file for this segment
+                    temp_filename = f"/tmp/{uuid.uuid4()}.mp3"
+                    with open(temp_filename, "wb") as f:
+                        result = client.text_to_speech.convert(
+                            text=segment["text"],
+                            voice_id=segment["voice_id"],
+                            model_id=segment["model_id"],
+                            output_format="mp3_44100_128",
+                        )
+                        for chunk in result:
+                            f.write(chunk)
+                    return temp_filename
+                return None
             
             # Process segments in parallel
             temp_files = []
             with ThreadPoolExecutor(max_workers=4) as executor:
-                temp_files = list(filter(None, executor.map(process_segment, segments)))
+                temp_files = list(filter(None, executor.map(process_segment, story_data["sections"])))
             
             # Combine audio files
             if temp_files:
