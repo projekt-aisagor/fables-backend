@@ -217,6 +217,7 @@ def render_story(story_id: int):
                         voice_id=segment["voice_id"],
                         model_id=segment["model_id"],
                         output_format="mp3_44100_128", 
+                        
                     )
                     for chunk in result:
                         f.write(chunk)
