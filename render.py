@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from mistralai.client import MistralClient
 from mistralai.models.chat_completion import ChatMessage
+from elevenlabs.client import ElevenLabs
 from typing import List, Dict
 import json
 import logging
@@ -48,44 +49,66 @@ def fetch_story_data(story_id: int) -> Dict:
         raise
 
 def parse_script_for_tts(story_script: str, characters: List[Dict]) -> List[Dict]:
-    """Ask Mistral to parse the script and generate text-to-speech tool calls"""
+    """Ask Mistral to parse the script and generate text-to-speech and sound effect segments"""
     
     # Create a character name to ID mapping
     char_map = {char["name"]: char["id"] for char in characters}
     
     # Create the prompt for Mistral
-    prompt = f"""You are a script parser that converts story scripts into text-to-speech segments.
+    prompt = f"""You are a script parser that converts story scripts into audio segments.
 
-Task: Parse the following script and output ONLY a JSON array of text-to-speech tool calls.
+Task: Parse the following script and output ONLY a JSON array of audio segments.
 
 Required format for each segment:
+For speech:
 {{
+    "type": "text_to_speech",
     "text": "The actual text to speak",
     "voice_id": "JBFqnCBsd6RMkjVDRZzb",
-    "model_id": "eleven_multilingual_v2",
-    "output_format": "mp3_44100_128"
+    "model_id": "eleven_multilingual_v2"
+}}
+
+For sound effects (convert descriptions to English):
+{{
+    "type": "text_to_sound_effects",
+    "text": "sound of birds chirping in the forest"
+}}
+
+For pauses:
+{{
+    "type": "pause",
+    "seconds": 1
 }}
 
 Rules:
 1. Split the script into logical segments at each speaker change or paragraph
 2. Remove speaker attributions (e.g., "LUNA:") from the text
-3. Keep pauses [...] and sound effects (in parentheses) in the text
-4. Ensure the output is valid JSON
-5. Return ONLY the JSON array, no explanations or other text
+3. Convert sound effects (in parentheses) into English text_to_sound_effects segments
+4. Add 1-second pauses between major segments
+5. Ensure the output is valid JSON
+6. Return ONLY the JSON array, no explanations or other text
 
 Example output:
 [
     {{
+        "type": "text_to_speech",
         "text": "Once upon a time in a magical forest...",
         "voice_id": "JBFqnCBsd6RMkjVDRZzb",
-        "model_id": "eleven_multilingual_v2",
-        "output_format": "mp3_44100_128"
+        "model_id": "eleven_multilingual_v2"
     }},
     {{
-        "text": "Who goes there? [...] Show yourself!",
+        "type": "text_to_sound_effects",
+        "text": "sound of gentle wind rustling through leaves"
+    }},
+    {{
+        "type": "pause",
+        "seconds": 1
+    }},
+    {{
+        "type": "text_to_speech",
+        "text": "Who goes there? Show yourself!",
         "voice_id": "JBFqnCBsd6RMkjVDRZzb",
-        "model_id": "eleven_multilingual_v2",
-        "output_format": "mp3_44100_128"
+        "model_id": "eleven_multilingual_v2"
     }}
 ]
 
@@ -116,7 +139,6 @@ Remember: Output ONLY the JSON array, nothing else."""
         # Try to find JSON array in the response
         content = content.strip()
         if not content.startswith('['):
-            # Try to find the start of the JSON array
             start_idx = content.find('[')
             if start_idx != -1:
                 content = content[start_idx:]
@@ -124,7 +146,6 @@ Remember: Output ONLY the JSON array, nothing else."""
                 raise ValueError("No JSON array found in response")
         
         if not content.endswith(']'):
-            # Try to find the end of the JSON array
             end_idx = content.rfind(']')
             if end_idx != -1:
                 content = content[:end_idx+1]
@@ -132,19 +153,31 @@ Remember: Output ONLY the JSON array, nothing else."""
                 raise ValueError("No JSON array end found in response")
         
         # Parse the JSON
-        tool_calls = json.loads(content)
+        segments = json.loads(content)
         
         # Validate the structure
-        if not isinstance(tool_calls, list):
+        if not isinstance(segments, list):
             raise ValueError("Response is not a JSON array")
         
-        for call in tool_calls:
-            required_keys = {"text", "voice_id", "model_id", "output_format"}
-            if not all(key in call for key in required_keys):
-                raise ValueError(f"Missing required keys in tool call: {call}")
+        for segment in segments:
+            if "type" not in segment:
+                raise ValueError(f"Missing 'type' in segment: {segment}")
+                
+            if segment["type"] == "text_to_speech":
+                required_keys = {"text", "voice_id", "model_id"}
+                if not all(key in segment for key in required_keys):
+                    raise ValueError(f"Missing required keys in text_to_speech segment: {segment}")
+            elif segment["type"] == "text_to_sound_effects":
+                if "text" not in segment:
+                    raise ValueError(f"Missing 'text' in sound_effects segment: {segment}")
+            elif segment["type"] == "pause":
+                if "seconds" not in segment:
+                    raise ValueError(f"Missing 'seconds' in pause segment: {segment}")
+            else:
+                raise ValueError(f"Unknown segment type: {segment['type']}")
         
-        logger.info(f"Successfully parsed {len(tool_calls)} text-to-speech segments")
-        return tool_calls
+        logger.info(f"Successfully parsed {len(segments)} audio segments")
+        return segments
         
     except json.JSONDecodeError as e:
         logger.error(f"JSON parsing error: {e}")
@@ -158,26 +191,50 @@ def render_story(story_id: int):
     """Main function to render a story"""
     try:
         # Fetch story data
-        logger.info(f"Fetching data for story {story_id}")
         story_data = fetch_story_data(story_id)
+        story = story_data["story"]
+        characters = story_data["characters"]
         
-        if not story_data["story"].get("story_script"):
-            logger.error("Story script is empty")
-            return
+        # Parse the script into segments
+        segments = parse_script_for_tts(story["story_script"], characters)
         
-        # Parse script and generate TTS tool calls
-        logger.info("Parsing script for text-to-speech")
-        tts_segments = parse_script_for_tts(
-            story_data["story"]["story_script"],
-            story_data["characters"]
+        # Initialize ElevenLabs client
+        client = ElevenLabs(
+            api_key=os.getenv("ELEVENLABS_API_KEY")
         )
         
-        # Print the tool calls (for now)
-        logger.info("Generated text-to-speech segments:")
-        for i, segment in enumerate(tts_segments, 1):
-            print(f"\nSegment {i}:")
-            print(json.dumps(segment, indent=2))
-            
+        output_path = "output.mp3"
+        logger.info(f"Starting audio rendering to {output_path}")
+        
+        # Render all segments
+        with open(output_path, "wb") as f:
+            for segment in segments:
+                logger.info(f"Processing segment type: {segment['type']}")
+                
+                if segment["type"] == "text_to_speech":
+                    result = client.text_to_speech.convert(
+                        text=segment["text"],
+                        voice_id=segment["voice_id"],
+                        model_id=segment["model_id"]
+                    )
+                    for chunk in result:
+                        f.write(chunk)
+                        
+                elif segment["type"] == "text_to_sound_effects":
+                    result = client.text_to_sound_effects.convert(
+                        text=segment["text"]
+                    )
+                    for chunk in result:
+                        f.write(chunk)
+                        
+                elif segment["type"] == "pause":
+                    # For now, we skip pauses as they need to be handled differently
+                    # TODO: Implement proper pause handling
+                    continue
+                    
+        logger.info(f"Successfully rendered story to {output_path}")
+        return output_path
+        
     except Exception as e:
         logger.error(f"Error rendering story: {e}")
         raise
