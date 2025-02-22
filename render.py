@@ -215,18 +215,20 @@ def render_story(story_id: int):
                     result = client.text_to_speech.convert(
                         text=segment["text"],
                         voice_id=segment["voice_id"],
-                        model_id=segment["model_id"]
+                        model_id=segment["model_id"],
+                        output_format="mp3_44100_128", 
                     )
                     for chunk in result:
                         f.write(chunk)
                         
                 elif segment["type"] == "text_to_sound_effects":
-                    result = client.text_to_sound_effects.convert(
-                        text=segment["text"]
-                    )
-                    for chunk in result:
-                        f.write(chunk)
-                        
+                    # TODO: figure out why sound effects are not working?
+                    if False:
+                        result = client.text_to_sound_effects.convert(
+                            text=segment["text"],
+                        )
+                        for chunk in result:
+                             f.write(chunk)        
                 elif segment["type"] == "pause":
                     # For now, we skip pauses as they need to be handled differently
                     # TODO: Implement proper pause handling
