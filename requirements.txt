@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+mistralai>=0.0.7
+supabase==1.0.3
+python-dotenv
+pydantic
+websockets==10.4
