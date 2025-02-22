@@ -11,6 +11,8 @@ import logging
 import uuid
 from elevenlabs.client import ElevenLabs
 import json
+from concurrent.futures import ThreadPoolExecutor
+from pydub import AudioSegment
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -36,7 +38,7 @@ async def log_request_body(request: Request, call_next):
 # Initialize Mistral client
 mistral_api_key = os.environ["MISTRAL_API_KEY"]
 mistral_client = MistralClient(api_key=mistral_api_key)
-model = "ministral-3b-latest" #"mistral-large-latest"
+model = "mistral-large-latest"
 
 # Initialize Supabase client
 supabase: Client = create_client(
@@ -384,30 +386,50 @@ Write the complete story script:"""
                 api_key=os.getenv("ELEVENLABS_API_KEY")
             )
             
-            # Generate a random filename for the MP3
+            # Generate a random filename for the final MP3
             output_filename = f"{uuid.uuid4()}.mp3"
             output_path = f"/tmp/{output_filename}"
-            logger.info(f"Starting audio rendering to {output_path}")
+            logger.info(f"Starting parallel audio rendering")
             
-            # Render all segments
-            with open(output_path, "wb") as f:
-                for segment in segments:
-                    logger.info(f"Processing segment type: {segment['type']}")
+            def process_segment(segment):
+                if segment["type"] != "text_to_speech":
+                    return None
                     
-                    if segment["type"] == "text_to_speech":
-                        result = client.text_to_speech.convert(
-                            text=segment["text"],
-                            voice_id=segment["voice_id"],
-                            model_id=segment["model_id"],
-                            output_format="mp3_44100_128"
-                        )
-                        for chunk in result:
-                            f.write(chunk)
-                    
-                    elif segment["type"] == "pause":
-                        # For now, we skip pauses as they need to be handled differently
-                        continue
+                # Create a temporary file for this segment
+                temp_filename = f"/tmp/{uuid.uuid4()}.mp3"
+                with open(temp_filename, "wb") as f:
+                    result = client.text_to_speech.convert(
+                        text=segment["text"],
+                        voice_id=segment["voice_id"],
+                        model_id=segment["model_id"],
+                        output_format="mp3_44100_128",
+                    )
+                    for chunk in result:
+                        f.write(chunk)
+                return temp_filename
             
+            # Process segments in parallel
+            temp_files = []
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                temp_files = list(filter(None, executor.map(process_segment, segments)))
+            
+            # Combine audio files
+            if temp_files:
+                combined = AudioSegment.from_mp3(temp_files[0])
+                for temp_file in temp_files[1:]:
+                    audio = AudioSegment.from_mp3(temp_file)
+                    combined += audio
+                
+                # Export the combined audio
+                combined.export(output_path, format="mp3")
+                
+                # Clean up temporary files
+                for temp_file in temp_files:
+                    try:
+                        os.remove(temp_file)
+                    except Exception as e:
+                        logger.error(f"Error removing temporary file {temp_file}: {e}")
+                
             logger.info(f"Successfully rendered story to {output_path}")
 
             # Upload the file to Supabase Storage
@@ -510,7 +532,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=9000,
+        port=9001,
         reload=True,  # Enable hot reloading
         reload_dirs=["."]  # Watch current directory for changes
     )
