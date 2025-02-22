@@ -5,10 +5,12 @@ from mistralai.models.chat_completion import ChatMessage
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 import logging
 import uuid
+from elevenlabs.client import ElevenLabs
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +68,142 @@ class WebhookResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+def parse_script_for_tts(story_script: str, characters: List[Dict]) -> List[Dict]:
+    """Ask Mistral to parse the script and generate text-to-speech and sound effect segments"""
+    
+    # Create the prompt for Mistral
+    prompt = f"""You are a script parser that converts story scripts into audio segments.
+
+Task: Parse the following script and output ONLY a JSON array of audio segments.
+
+Required format for each segment:
+For speech:
+{{
+    "type": "text_to_speech",
+    "text": "The actual text to speak",
+    "voice_id": "JBFqnCBsd6RMkjVDRZzb",
+    "model_id": "eleven_multilingual_v2"
+}}
+
+For sound effects (convert descriptions to English):
+{{
+    "type": "text_to_sound_effects",
+    "text": "sound of birds chirping in the forest"
+}}
+
+For pauses:
+{{
+    "type": "pause",
+    "seconds": 1
+}}
+
+Rules:
+1. Split the script into logical segments at each speaker change or paragraph
+2. Remove speaker attributions (e.g., "LUNA:") from the text
+3. Convert sound effects (in parentheses) into English text_to_sound_effects segments
+4. Add 1-second pauses between major segments
+5. Ensure the output is valid JSON
+6. Return ONLY the JSON array, no explanations or other text
+
+Example output:
+[
+    {{
+        "type": "text_to_speech",
+        "text": "Once upon a time in a magical forest...",
+        "voice_id": "JBFqnCBsd6RMkjVDRZzb",
+        "model_id": "eleven_multilingual_v2"
+    }},
+    {{
+        "type": "text_to_sound_effects",
+        "text": "sound of gentle wind rustling through leaves"
+    }},
+    {{
+        "type": "pause",
+        "seconds": 1
+    }},
+    {{
+        "type": "text_to_speech",
+        "text": "Who goes there? Show yourself!",
+        "voice_id": "JBFqnCBsd6RMkjVDRZzb",
+        "model_id": "eleven_multilingual_v2"
+    }}
+]
+
+Here is the script to parse:
+
+{story_script}
+
+Remember: Output ONLY the JSON array, nothing else."""
+
+    try:
+        # Get Mistral's response
+        messages = [
+            ChatMessage(
+                role="user",
+                content=prompt
+            )
+        ]
+        
+        response = mistral_client.chat(
+            messages=messages,
+            model=model
+        )
+        
+        # Get the content and debug log it
+        content = response.choices[0].message.content
+        logger.info(f"Raw Mistral response:\n{content}")
+        
+        # Try to find JSON array in the response
+        content = content.strip()
+        if not content.startswith('['):
+            start_idx = content.find('[')
+            if start_idx != -1:
+                content = content[start_idx:]
+            else:
+                raise ValueError("No JSON array found in response")
+        
+        if not content.endswith(']'):
+            end_idx = content.rfind(']')
+            if end_idx != -1:
+                content = content[:end_idx+1]
+            else:
+                raise ValueError("No JSON array end found in response")
+        
+        # Parse the JSON
+        segments = json.loads(content)
+        
+        # Validate the structure
+        if not isinstance(segments, list):
+            raise ValueError("Response is not a JSON array")
+        
+        for segment in segments:
+            if "type" not in segment:
+                raise ValueError(f"Missing 'type' in segment: {segment}")
+                
+            if segment["type"] == "text_to_speech":
+                required_keys = {"text", "voice_id", "model_id"}
+                if not all(key in segment for key in required_keys):
+                    raise ValueError(f"Missing required keys in text_to_speech segment: {segment}")
+            elif segment["type"] == "text_to_sound_effects":
+                if "text" not in segment:
+                    raise ValueError(f"Missing 'text' in sound_effects segment: {segment}")
+            elif segment["type"] == "pause":
+                if "seconds" not in segment:
+                    raise ValueError(f"Missing 'seconds' in pause segment: {segment}")
+            else:
+                raise ValueError(f"Unknown segment type: {segment['type']}")
+        
+        logger.info(f"Successfully parsed {len(segments)} audio segments")
+        return segments
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {e}")
+        logger.error(f"Problematic content: {content}")
+        raise
+    except Exception as e:
+        logger.error(f"Error parsing script: {e}")
+        raise
 
 async def generate_story(story_record: StoryRecord, supabase: Client, mistral: MistralClient):
     """Background task to generate and save the story"""
@@ -173,18 +311,102 @@ Write the complete story script:"""
         story_script = chat_response.choices[0].message.content
         logger.info("Story generated successfully")
         
-        # Update the story in Supabase
+        # Update the story in Supabase with the script
         try:
             supabase.table("stories")\
-                .update({"story_script": story_script})\
+                .update({"story_script": story_script, "status": "generating_audio"})\
                 .eq("id", story_record.id)\
                 .execute()
             logger.info(f"Story {story_record.id} updated with generated script")
         except Exception as e:
             logger.error(f"Error updating story in database: {e}")
+            return
+
+        # Parse the script into segments for audio generation
+        try:
+            segments = parse_script_for_tts(story_script, characters.data)
+            
+            # Initialize ElevenLabs client
+            client = ElevenLabs(
+                api_key=os.getenv("ELEVENLABS_API_KEY")
+            )
+            
+            # Generate a random filename for the MP3
+            output_filename = f"{uuid.uuid4()}.mp3"
+            output_path = f"/tmp/{output_filename}"
+            logger.info(f"Starting audio rendering to {output_path}")
+            
+            # Render all segments
+            with open(output_path, "wb") as f:
+                for segment in segments:
+                    logger.info(f"Processing segment type: {segment['type']}")
+                    
+                    if segment["type"] == "text_to_speech":
+                        result = client.text_to_speech.convert(
+                            text=segment["text"],
+                            voice_id=segment["voice_id"],
+                            model_id=segment["model_id"],
+                            output_format="mp3_44100_128"
+                        )
+                        for chunk in result:
+                            f.write(chunk)
+                    
+                    elif segment["type"] == "pause":
+                        # For now, we skip pauses as they need to be handled differently
+                        continue
+            
+            logger.info(f"Successfully rendered story to {output_path}")
+
+            # Upload the file to Supabase Storage
+            try:
+                with open(output_path, 'rb') as f:
+                    supabase.storage.from_("story-audio").upload(
+                        path=output_filename,
+                        file=f,
+                        file_options={"content-type": "audio/mpeg"}
+                    )
+                logger.info(f"Successfully uploaded audio file to Supabase Storage: {output_filename}")
+
+                # Update the story record with the audio file path and set status to ready
+                supabase.table("stories")\
+                    .update({
+                        "audio_file": output_filename,
+                        "status": "done"
+                    })\
+                    .eq("id", story_record.id)\
+                    .execute()
+                logger.info(f"Story {story_record.id} marked as ready with audio file {output_filename}")
+
+                # Clean up the temporary file
+                os.remove(output_path)
+                logger.info(f"Cleaned up temporary file {output_path}")
+
+            except Exception as e:
+                logger.error(f"Error uploading to Supabase Storage: {e}")
+                # Update status to error
+                supabase.table("stories")\
+                    .update({"status": "error"})\
+                    .eq("id", story_record.id)\
+                    .execute()
+                
+        except Exception as e:
+            logger.error(f"Error in audio generation process: {e}")
+            # Update status to error
+            supabase.table("stories")\
+                .update({"status": "error"})\
+                .eq("id", story_record.id)\
+                .execute()
             
     except Exception as e:
         logger.error(f"Error in story generation process: {e}")
+        # Update status to error
+        try:
+            supabase.table("stories")\
+                .update({"status": "error"})\
+                .eq("id", story_record.id)\
+                .execute()
+        except:
+            pass
 
 @app.post("/webhook/story", response_model=WebhookResponse)
 async def handle_story_webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
