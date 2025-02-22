@@ -6,3 +6,4 @@ python-dotenv
 pydantic
 websockets==10.4
 elevenlabs
+fal-client

@@ -13,6 +13,8 @@ from elevenlabs.client import ElevenLabs
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pydub import AudioSegment
+import fal_client
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -460,8 +462,25 @@ Write the complete story in the specified JSON format:"""
                 .eq("id", story_record.id)\
                 .execute()
             
+        # Generate image prompt from the story
+        scene_prompt = generate_scene_prompt(json.dumps(story_data), mistral)
+        logger.info(f"Generated scene prompt: {scene_prompt}")
+        
+        # Generate the image
+        image_result = await generate_story_image(scene_prompt)
+        if image_result and 'images' in image_result and image_result['images']:
+            image_url = image_result['images'][0]['url']
+            
+            # Update the story record with the image URL
+            supabase.table("stories").update({
+                "image_file": image_url,
+            }).eq("id", story_record.id).execute()
+            logger.info(f"Updated story {story_record.id} with image URL: {image_url}")
+        else:
+            logger.error("Failed to generate image or get URL from response")
+            
     except Exception as e:
-        logger.error(f"Error in story generation process: {e}")
+        logger.error(f"Error in story generation: {e}")
         # Update status to error
         try:
             supabase.table("stories")\
@@ -471,8 +490,37 @@ Write the complete story in the specified JSON format:"""
         except:
             pass
 
+def generate_scene_prompt(story_script: str, mistral_client: MistralClient) -> str:
+    """Generate a prompt for image generation based on a key scene from the story."""
+    messages = [
+        ChatMessage(role="user", content=f"You are a prompt engineer for image generation. Your task is to identify the single most visually striking scene from the story and create a concise, focused prompt (1 paragraphs max). Focus on the key visual elements that define the scene: lighting, composition, mood, colors, and the main subject. Be specific but concise. The prompt should read like a clear artistic direction for a single powerful image.\nHere is the story:\n\n{story_script}")
+    ]
+    
+    response = mistral_client.chat(
+        model=model,
+        messages=messages
+    )
+    
+    # Access the content from the response directly
+    return response.choices[0].message.content
+
+async def generate_story_image(prompt: str) -> dict:
+    """Generate an image using Fal AI based on the scene prompt."""
+    try:
+        result = fal_client.subscribe(
+            "fal-ai/flux-pro/v1.1",
+            arguments={"prompt": prompt},
+            with_logs=True
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error generating image: {e}")
+        return None
+
 @app.post("/webhook/story", response_model=WebhookResponse)
 async def handle_story_webhook(request: Request, payload: WebhookPayload, background_tasks: BackgroundTasks):
+    start_time = time.time()
+    
     # Log raw request body for debugging
     body = await request.json()
     logger.info(f"Raw webhook request body: {json.dumps(body, indent=2)}")
@@ -514,6 +562,10 @@ async def handle_story_webhook(request: Request, payload: WebhookPayload, backgr
             status="error",
             message=str(e)
         )
+    finally:
+        end_time = time.time()
+        process_time = end_time - start_time
+        logger.info(f"Total webhook processing time: {process_time:.3f} seconds")
 
 if __name__ == "__main__":
     import uvicorn
