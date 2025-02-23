@@ -1,7 +1,6 @@
 import os
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from mistralai.client import MistralClient
-from mistralai.models.chat_completion import ChatMessage
+from mistralai import Mistral, UserMessage
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from pydantic import BaseModel
@@ -44,7 +43,7 @@ async def log_request_body(request: Request, call_next):
 
 # Initialize Mistral client
 mistral_api_key = os.environ["MISTRAL_API_KEY"]
-mistral_client = MistralClient(api_key=mistral_api_key)
+mistral_client = Mistral(api_key=mistral_api_key)
 model = "mistral-large-latest"
 
 # Initialize Supabase client
@@ -138,7 +137,7 @@ def get_language_name(language_code: str) -> str:
     }
     return language_map.get(language_code.lower(), "English")  # Default to English if code not found
 
-async def generate_story(story_record: StoryRecord, supabase: Client, mistral: MistralClient):
+async def generate_story(story_record: StoryRecord, supabase: Client, mistral: Mistral):
     """Background task to generate and save the story"""
     logger.info(f"Starting async story generation for story {story_record.id}")
     
@@ -211,14 +210,7 @@ async def generate_story(story_record: StoryRecord, supabase: Client, mistral: M
             voice_info += f"- {description} (voice_id: {voice_id})\n"
 
         skip_for_now = """
-        {{
-            "type": "text_to_sound_effects",
-            "text": "sound of birds chirping in the forest"
-        }},
-        {{
-            "type": "pause",
-            "seconds": 1
-        }}
+
 """
         
         # Generate story script using Mistral
@@ -242,6 +234,14 @@ Your output must be a JSON object with the following structure:
             "text": "The actual text to speak",
             "voice_id": "<voice_id from available voices>",
             "model_id": "eleven_multilingual_v2"
+        }},
+        {{
+            "type": "text_to_sound_effects",
+            "text": "sound of birds chirping in the forest"
+        }},
+        {{
+            "type": "pause",
+            "seconds": 1
         }}
     ]
 }}
@@ -263,14 +263,14 @@ Write the complete story in the specified JSON format:"""
         logger.info(f"Generating story with prompt: {prompt}")
         
         messages = [
-            ChatMessage(
+            UserMessage(
                 role="user",
                 content=prompt
             )
         ]
         
         # Generate the story
-        chat_response = mistral.chat(
+        chat_response = mistral.chat.complete(
             messages=messages,
             model=model,
             max_tokens=100000,
@@ -522,10 +522,10 @@ Write the complete story in the specified JSON format:"""
         except:
             pass
 
-def generate_scene_prompt(story_script: str, mistral_client: MistralClient, base_values_str: str) -> str:
+def generate_scene_prompt(story_script: str, mistral_client: Mistral, base_values_str: str) -> str:
     """Generate a prompt for image generation based on a key scene from the story."""
     messages = [
-        ChatMessage(role="user", content=f"""You are a prompt engineer for image generation. Your task is to identify the single most visually striking scene from the story and create a concise, focused prompt (1 paragraphs max). Focus on the key visual elements that define the scene: lighting, composition, mood, colors, and the main subject. Be specific but concise. The prompt should read like a clear artistic direction for a single powerful image.
+        UserMessage(role="user", content=f"""You are a prompt engineer for image generation. Your task is to identify the single most visually striking scene from the story and create a concise, focused prompt (1 paragraphs max). Focus on the key visual elements that define the scene: lighting, composition, mood, colors, and the main subject. Be specific but concise. The prompt should read like a clear artistic direction for a single powerful image.
 
 The scene should reflect these core values and themes:
 {base_values_str}
@@ -535,7 +535,7 @@ Here is the story:
 {story_script}""")
     ]
     
-    response = mistral_client.chat(
+    response = mistral_client.chat.complete(
         model=model,
         messages=messages
     )
