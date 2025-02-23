@@ -27,6 +27,10 @@ load_dotenv()
 # Initialize FastAPI
 app = FastAPI()
 
+@app.get("/healthz")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
 @app.middleware("http")
 async def log_request_body(request: Request, call_next):
     if request.url.path == "/webhook/story":
