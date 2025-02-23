@@ -205,16 +205,29 @@ async def generate_story(story_record: StoryRecord, supabase: Client, mistral: M
         voice_info = "Available voices:\n"
         for voice_id, description in voice_lib.items():
             voice_info += f"- {description} (voice_id: {voice_id})\n"
+
+        skip_for_now = """
+        {{
+            "type": "text_to_sound_effects",
+            "text": "sound of birds chirping in the forest"
+        }},
+        {{
+            "type": "pause",
+            "seconds": 1
+        }}
+"""
         
         # Generate story script using Mistral
         language_name = get_language_name(language)
         prompt = f"""You are a professional storyteller crafting an engaging audio story in {language_name}. Create a story that:
 1. Follows this storyline prompt: {story_record.storyline_prompt}
-2. Is approximately {story_record.minutes_long} minutes long when read aloud at a natural pace
+2. Is approximately {story_record.minutes_long} minutes long when read aloud at a natural pace. 10 medium length sentences translates to approximately 1.5 minutes.
 3. Takes place in the world: {world.data['name']} - {world.data['description']}
 4. Features these characters:
 {character_descriptions}
 5. Aligns with these base values: {base_values_str}
+
+Make use of story telling techniques like the heroes journey to create a compelling story.
 
 Your output must be a JSON object with the following structure:
 {{
@@ -225,14 +238,6 @@ Your output must be a JSON object with the following structure:
             "text": "The actual text to speak",
             "voice_id": "<voice_id from available voices>",
             "model_id": "eleven_multilingual_v2"
-        }},
-        {{
-            "type": "text_to_sound_effects",
-            "text": "sound of birds chirping in the forest"
-        }},
-        {{
-            "type": "pause",
-            "seconds": 1
         }}
     ]
 }}
@@ -263,7 +268,9 @@ Write the complete story in the specified JSON format:"""
         # Generate the story
         chat_response = mistral.chat(
             messages=messages,
-            model=model
+            model=model,
+            max_tokens=100000,
+            temperature=0.7,
         )
         
         # Log the raw response for debugging
@@ -478,7 +485,7 @@ Write the complete story in the specified JSON format:"""
                 return None
 
         # Generate image prompt and start image generation
-        scene_prompt = generate_scene_prompt(json.dumps(story_data), mistral)
+        scene_prompt = generate_scene_prompt(json.dumps(story_data), mistral, base_values_str)
         logger.info(f"Generated scene prompt: {scene_prompt}")
         image_task = asyncio.create_task(generate_story_image(scene_prompt))
         
@@ -511,10 +518,17 @@ Write the complete story in the specified JSON format:"""
         except:
             pass
 
-def generate_scene_prompt(story_script: str, mistral_client: MistralClient) -> str:
+def generate_scene_prompt(story_script: str, mistral_client: MistralClient, base_values_str: str) -> str:
     """Generate a prompt for image generation based on a key scene from the story."""
     messages = [
-        ChatMessage(role="user", content=f"You are a prompt engineer for image generation. Your task is to identify the single most visually striking scene from the story and create a concise, focused prompt (1 paragraphs max). Focus on the key visual elements that define the scene: lighting, composition, mood, colors, and the main subject. Be specific but concise. The prompt should read like a clear artistic direction for a single powerful image.\nHere is the story:\n\n{story_script}")
+        ChatMessage(role="user", content=f"""You are a prompt engineer for image generation. Your task is to identify the single most visually striking scene from the story and create a concise, focused prompt (1 paragraphs max). Focus on the key visual elements that define the scene: lighting, composition, mood, colors, and the main subject. Be specific but concise. The prompt should read like a clear artistic direction for a single powerful image.
+
+The scene should reflect these core values and themes:
+{base_values_str}
+
+Here is the story:
+
+{story_script}""")
     ]
     
     response = mistral_client.chat(
