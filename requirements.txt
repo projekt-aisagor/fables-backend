@@ -7,3 +7,4 @@ pydantic
 websockets
 elevenlabs==1.51.0
 fal-client
+pydub

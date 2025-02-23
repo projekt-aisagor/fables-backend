@@ -598,7 +598,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=9001,
+        port=10000,
         reload=True,  # Enable hot reloading
         reload_dirs=["."]  # Watch current directory for changes
     )
